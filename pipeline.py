@@ -209,8 +209,7 @@ def detect_fields_layout_free(img: np.ndarray) -> dict[str, list[OCRResult]]:
     detections.sort(key=lambda d: sum(p[1] for p in d[0]) / 4)
 
     fields: dict[str, list[OCRResult]] = {
-        "date": [], "payee": [], "amount_digits": [],
-        "amount_words": [], "memo": [], "micr": [], "other": [],
+        "date": [], "payee": [], "amount_digits": [], "amount_words": [],
     }
     assigned: set[int] = set()
 
@@ -232,10 +231,9 @@ def detect_fields_layout_free(img: np.ndarray) -> dict[str, list[OCRResult]]:
                   int(max(p[1] for p in bbox) - min(p[1] for p in bbox))),
         )
 
-    # Pass 1 — MICR line: bottom 22% of page, long digit/symbol run
+    # Pass 1 — Skip MICR area: mark bottom 22% as assigned so nothing bleeds into other fields
     for i, (bbox, text, conf) in enumerate(detections):
         if centroid_y(bbox) / h > 0.78 and _MICR_RE.search(text):
-            fields["micr"].append(make_result(bbox, text, conf))
             assigned.add(i)
 
     # Pass 2 — Date: matches date pattern anywhere on page
@@ -347,30 +345,6 @@ def detect_fields_layout_free(img: np.ndarray) -> dict[str, list[OCRResult]]:
         script = "arabic" if _ARABIC_RE.search(text) else "latin"
         fields["payee"].append(make_result(bbox, text, conf, script))
         assigned.add(i)
-
-    _ACCOUNT_RE = re.compile(
-        r'\b(?:account|acc\.?|a/c)\b.*\d|\d{4}[\-\s]\d{4}[\-\s]\d{2,}',
-        re.IGNORECASE,
-    )
-
-    # Pass 6 — Memo: short unassigned line in lower half, not MICR area,
-    # and not a printed label or account number
-    for i, (bbox, text, conf) in enumerate(detections):
-        if i in assigned:
-            continue
-        cy = centroid_y(bbox) / h
-        if (0.55 < cy < 0.80
-                and 3 < len(text.strip()) < 60
-                and not _PRINTED_LABELS_RE.match(text.strip())
-                and not _AMOUNT_WORDS_RE.search(text)
-                and not _ACCOUNT_RE.search(text)):
-            fields["memo"].append(make_result(bbox, text, conf))
-            assigned.add(i)
-
-    # Pass 7 — everything else
-    for i, (bbox, text, conf) in enumerate(detections):
-        if i not in assigned:
-            fields["other"].append(make_result(bbox, text, conf))
 
     return {k: v for k, v in fields.items() if v}
 

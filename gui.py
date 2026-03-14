@@ -40,7 +40,6 @@ COLORS = {
     "payee":         (0,   180, 0),
     "amount_digits": (0,   0,   255),
     "amount_words":  (200, 100, 0),
-    "memo":          (180, 0,   180),
 }
 
 DEFAULT_COLOR = (0, 200, 200)
