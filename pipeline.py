@@ -160,7 +160,12 @@ TEMPLATES = {
 
 # Precompile patterns used by detect_fields_layout_free
 _DATE_RE         = re.compile(r'\d{1,2}[\/\-\.]\d{1,2}[\/\-\.]\d{2,4}')
-_AMOUNT_DIGIT_RE = re.compile(r'[\d\u0660-\u0669][,،\d\u0660-\u0669]*[.\u066B][\d\u0660-\u0669]{2}')
+_AMOUNT_DIGIT_RE = re.compile(
+    r'(?:[\d\u0660-\u0669]{1,3}(?:[,،][\d\u0660-\u0669]{3})+)'   # 1,234 or 1,234,567
+    r'(?:[./\u066B][\d\u0660-\u0669]{1,3})?'                      # optional decimal (1-3 places)
+    r'|[\d\u0660-\u0669]{4,}'                                      # OR 4+ bare digits (e.g. 5250)
+    r'|[\d\u0660-\u0669]{1,3}[./\u066B][\d\u0660-\u0669]{1,3}'   # OR decimal without comma (e.g. 50.000)
+)
 _MICR_RE         = re.compile(r'[\d:⑆⑇⑈⑉]{9,}')  # MICR digits + symbols
 _ARABIC_RE       = re.compile(r'[\u0600-\u06FF]')
 
@@ -236,6 +241,28 @@ def detect_fields_layout_free(img: np.ndarray) -> dict[str, list[OCRResult]]:
             fields["amount_digits"].append(make_result(bbox, text, conf))
             assigned.add(i)
 
+    # Pass 3b — Positional fallback: if still no amount_digits found,
+    # look for the most numeric-looking token in the right half of the cheque
+    if not fields["amount_digits"]:
+        _DIGITS_ONLY = re.compile(r'[\d\u0660-\u0669,،./٫\s]{3,}')
+        candidates = [
+            (i, bbox, text, conf)
+            for i, (bbox, text, conf) in enumerate(detections)
+            if i not in assigned
+            and centroid_x(bbox) / w > 0.45          # right half
+            and centroid_y(bbox) / h < 0.70           # not in MICR area
+            and _DIGITS_ONLY.search(text)
+            and sum(ch.isdigit() or '\u0660' <= ch <= '\u0669' for ch in text) >= 2
+        ]
+        if candidates:
+            # Pick the one with the highest digit ratio
+            best = max(candidates, key=lambda x: sum(
+                ch.isdigit() or '\u0660' <= ch <= '\u0669' for ch in x[2]
+            ) / max(len(x[2]), 1))
+            i, bbox, text, conf = best
+            fields["amount_digits"].append(make_result(bbox, text, conf))
+            assigned.add(i)
+
     # Pass 4 — Amount in words: longest unassigned line in middle vertical band
     # (typically 25%-72% height, width spanning >35% of page)
     candidates = [
@@ -290,10 +317,20 @@ def detect_fields_layout_free(img: np.ndarray) -> dict[str, list[OCRResult]]:
 # ---------------------------------------------------------------------------
 
 def parse_amount(raw: str) -> float | None:
-    cleaned = re.sub(r"[^\d.,]", "", raw)
-    cleaned = cleaned.replace(",", "").replace(" ", "")
-    # Handle OCR dropping the decimal: if no dot and len > 2, try inserting
-    # before last 2 digits (common for currency)
+    # Convert Arabic-Indic numerals (٠١٢٣٤٥٦٧٨٩) to Western digits
+    raw = raw.translate(str.maketrans('٠١٢٣٤٥٦٧٨٩', '0123456789'))
+    # Normalise Arabic decimal separator and OCR slash misread
+    raw = raw.replace('\u066B', '.').replace('/', '.')
+    # Strip currency symbols and whitespace
+    cleaned = re.sub(r'[^\d.,]', '', raw)
+    # Remove thousands separators (commas)
+    # If multiple dots exist, keep only the last one as the decimal separator
+    parts = cleaned.split('.')
+    if len(parts) > 2:
+        cleaned = ''.join(parts[:-1]) + '.' + parts[-1]
+    cleaned = cleaned.replace(',', '')
+    if not cleaned:
+        return None
     try:
         return float(cleaned)
     except ValueError:
