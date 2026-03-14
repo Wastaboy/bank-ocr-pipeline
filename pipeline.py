@@ -332,7 +332,9 @@ def parse_amount(raw: str) -> float | None:
     if not cleaned:
         return None
     try:
-        return float(cleaned)
+        value = float(cleaned)
+        # Return as integer if no meaningful decimal part
+        return int(value) if value == int(value) else value
     except ValueError:
         return None
 
