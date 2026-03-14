@@ -324,20 +324,27 @@ def detect_fields_layout_free(img: np.ndarray) -> dict[str, list[OCRResult]]:
             fields["amount_words"].append(make_result(bbox, text, conf, script))
             assigned.add(i)
 
-    # Pass 5 — Payee: longest unassigned line in upper 65% that does NOT
-    # look like amount-in-words, a bank name header, or a printed label
+    # Pass 5 — Payee: longest unassigned line in upper 55% that does NOT
+    # look like amount-in-words, a bank/institution header, an account number,
+    # or a printed label
     _BANK_HEADER_RE = re.compile(
         r'\b(?:bank|financial|harbour|harbor|branch|swift|iban|bhd|kwd|sar|aed|usd)\b',
+        re.IGNORECASE,
+    )
+    _ACCOUNT_NUM_RE = re.compile(
+        r'\b(?:account|acc\.?|a/c|no\.?)\s*[:\-]?\s*[\d]'   # "Account: 0091..."
+        r'|\d{4}[\-\s]\d{3,}',                               # bare XXXX-XXXX pattern
         re.IGNORECASE,
     )
     upper = [
         (i, bbox, text, conf)
         for i, (bbox, text, conf) in enumerate(detections)
         if i not in assigned
-        and 0.15 < centroid_y(bbox) / h < 0.65
+        and 0.15 < centroid_y(bbox) / h < 0.55   # tighter — keeps out memo/bottom area
         and len(text.strip()) > 2
         and not _AMOUNT_WORDS_RE.search(text)
         and not _BANK_HEADER_RE.search(text)
+        and not _ACCOUNT_NUM_RE.search(text)
         and not _PRINTED_LABELS_RE.match(text.strip())
     ]
     if upper:
