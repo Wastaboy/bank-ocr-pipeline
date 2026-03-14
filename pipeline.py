@@ -426,10 +426,29 @@ def words_to_amount(text: str) -> float | None:
       "Five Thousand Two Hundred Fifty Only" → 5250.0
     """
     text = text.lower()
-    # Split on the subunit keyword to separate major and minor parts
-    subunit_split = re.split(r'\b(?:fils?|halala[s]?|cent[s]?|baisa)\b', text, maxsplit=1)
-    major_text = re.sub(r'\b(?:dinar[s]?|riyal[s]?|pound[s]?|dollar[s]?|bhd|kwd|sar|aed|usd|only|and)\b', ' ', subunit_split[0])
-    minor_text = re.sub(r'\b(?:only|and)\b', ' ', subunit_split[1]) if len(subunit_split) > 1 else ''
+    # Detect whether a subunit (fils/cents etc.) appears in the string
+    has_subunit = bool(re.search(r'\b(?:fils?|halala[s]?|cent[s]?|baisa)\b', text))
+
+    if has_subunit:
+        # Split at the "and" that immediately precedes the minor amount
+        # e.g. "...Ninety Dinars AND Seven Hundred Fifty Fils Only"
+        # This keeps "Seven Hundred Fifty" out of the major calculation
+        and_split = re.split(
+            r'\band\b(?=[\w\s]*\b(?:fils?|halala[s]?|cent[s]?|baisa)\b)',
+            text, maxsplit=1,
+        )
+        major_raw = and_split[0]
+        minor_raw  = and_split[1] if len(and_split) > 1 else ''
+        # Strip the subunit keyword and trailing noise from minor part
+        minor_raw = re.split(r'\b(?:fils?|halala[s]?|cent[s]?|baisa)\b', minor_raw)[0]
+    else:
+        major_raw = text
+        minor_raw  = ''
+
+    # Strip currency names and noise from each part
+    _strip = r'\b(?:dinar[s]?|riyal[s]?|pound[s]?|dollar[s]?|bhd|kwd|sar|aed|usd|only|and|amount[:\s]*)\b'
+    major_text = re.sub(_strip, ' ', major_raw)
+    minor_text = re.sub(r'\b(?:only|and)\b', ' ', minor_raw)
 
     def _parse_chunk(words: str) -> int:
         tokens = re.findall(r'[a-z]+', words)
@@ -456,7 +475,7 @@ def words_to_amount(text: str) -> float | None:
 
     # Determine subunit divisor: fils/baisa → /1000, cents/halala → /100
     divisor = 1000 if re.search(r'\b(?:fils?|baisa)\b', text) else 100
-    return major + minor / divisor
+    return major + (minor / divisor if minor else 0)
 
 
 # ---------------------------------------------------------------------------
