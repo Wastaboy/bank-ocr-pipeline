@@ -168,6 +168,19 @@ _AMOUNT_DIGIT_RE = re.compile(
 )
 _MICR_RE         = re.compile(r'[\d:⑆⑇⑈⑉]{9,}')  # MICR digits + symbols
 _ARABIC_RE       = re.compile(r'[\u0600-\u06FF]')
+# Words that appear in amount-in-words lines (English and Arabic)
+_AMOUNT_WORDS_RE = re.compile(
+    r'\b(?:thousand|hundred|million|billion|dinar[s]?|fils|riyal[s]?|only|halala|baisa|dirham[s]?|pound[s]?|'
+    r'and\s+\w+\s+hundred|'
+    r'ألف|مائة|دينار|فلس|ريال|فقط)\b',
+    re.IGNORECASE,
+)
+# Printed labels on cheque forms that should never be extracted as fields
+_PRINTED_LABELS_RE = re.compile(
+    r'^(?:authorized\s+signature|memo|signature|for\s+and\s+on\s+behalf|'
+    r'signatory|sign\s+here|pay\s+to\s+the\s+order|date|amount)\s*[:\-]?\s*$',
+    re.IGNORECASE,
+)
 
 
 def detect_fields_layout_free(img: np.ndarray) -> dict[str, list[OCRResult]]:
@@ -233,61 +246,95 @@ def detect_fields_layout_free(img: np.ndarray) -> dict[str, list[OCRResult]]:
             fields["date"].append(make_result(bbox, text, conf))
             assigned.add(i)
 
+    def _best_amount_match(text: str) -> str | None:
+        """Extract the most currency-like numeric match from a text blob."""
+        matches = list(_AMOUNT_DIGIT_RE.finditer(text))
+        if not matches:
+            return None
+        # Prefer: comma-formatted > has decimal > longer
+        def score(m):
+            s = m.group(0)
+            return ((',' in s or '،' in s), ('.' in s or '/' in s), len(s))
+        return max(matches, key=score).group(0)
+
     # Pass 3 — Amount digits: currency amount pattern
+    # Only assigned if the blob is in the right half of the cheque (amount box position)
+    # and extract only the best numeric match — not the whole blob
     for i, (bbox, text, conf) in enumerate(detections):
         if i in assigned:
             continue
-        if _AMOUNT_DIGIT_RE.search(text):
-            fields["amount_digits"].append(make_result(bbox, text, conf))
+        numeric = _best_amount_match(text)
+        if numeric and centroid_x(bbox) / w > 0.40:
+            fields["amount_digits"].append(make_result(bbox, numeric, conf))
             assigned.add(i)
 
     # Pass 3b — Positional fallback: if still no amount_digits found,
-    # look for the most numeric-looking token in the right half of the cheque
+    # scan the right half for the most numeric-looking token
     if not fields["amount_digits"]:
-        _DIGITS_ONLY = re.compile(r'[\d\u0660-\u0669,،./٫\s]{3,}')
         candidates = [
             (i, bbox, text, conf)
             for i, (bbox, text, conf) in enumerate(detections)
             if i not in assigned
-            and centroid_x(bbox) / w > 0.45          # right half
-            and centroid_y(bbox) / h < 0.70           # not in MICR area
-            and _DIGITS_ONLY.search(text)
+            and centroid_x(bbox) / w > 0.45
+            and centroid_y(bbox) / h < 0.70
             and sum(ch.isdigit() or '\u0660' <= ch <= '\u0669' for ch in text) >= 2
         ]
         if candidates:
-            # Pick the one with the highest digit ratio
             best = max(candidates, key=lambda x: sum(
                 ch.isdigit() or '\u0660' <= ch <= '\u0669' for ch in x[2]
             ) / max(len(x[2]), 1))
             i, bbox, text, conf = best
-            fields["amount_digits"].append(make_result(bbox, text, conf))
+            numeric = _best_amount_match(text) or text
+            fields["amount_digits"].append(make_result(bbox, numeric, conf))
             assigned.add(i)
 
-    # Pass 4 — Amount in words: longest unassigned line in middle vertical band
-    # (typically 25%-72% height, width spanning >35% of page)
-    candidates = [
+    # Pass 4 — Amount in words: any unassigned line containing currency words.
+    # Grabs all matching lines to handle multi-line amounts
+    # (e.g. "Sixty Seven Thousand..." on one line and "and Seven Hundred Fifty Fils Only" on the next)
+    amount_word_lines = [
         (i, bbox, text, conf)
         for i, (bbox, text, conf) in enumerate(detections)
         if i not in assigned
-        and 0.25 < centroid_y(bbox) / h < 0.72
-        and len(text.strip()) > 6
+        and 0.15 < centroid_y(bbox) / h < 0.82
+        and _AMOUNT_WORDS_RE.search(text)
     ]
-    if candidates:
-        # Prefer widest line (amount-in-words spans most of the cheque width)
-        i, bbox, text, conf = max(candidates, key=lambda x: (
-            max(p[0] for p in x[1]) - min(p[0] for p in x[1])
-        ))
-        script = "arabic" if _ARABIC_RE.search(text) else "latin"
-        fields["amount_words"].append(make_result(bbox, text, conf, script))
-        assigned.add(i)
+    if amount_word_lines:
+        for i, bbox, text, conf in amount_word_lines:
+            script = "arabic" if _ARABIC_RE.search(text) else "latin"
+            fields["amount_words"].append(make_result(bbox, text, conf, script))
+            assigned.add(i)
+    else:
+        # Fallback: widest unassigned line in the middle band
+        candidates = [
+            (i, bbox, text, conf)
+            for i, (bbox, text, conf) in enumerate(detections)
+            if i not in assigned
+            and 0.25 < centroid_y(bbox) / h < 0.72
+            and len(text.strip()) > 6
+        ]
+        if candidates:
+            i, bbox, text, conf = max(candidates, key=lambda x: (
+                max(p[0] for p in x[1]) - min(p[0] for p in x[1])
+            ))
+            script = "arabic" if _ARABIC_RE.search(text) else "latin"
+            fields["amount_words"].append(make_result(bbox, text, conf, script))
+            assigned.add(i)
 
-    # Pass 5 — Payee: longest unassigned line in upper 65% of page
+    # Pass 5 — Payee: longest unassigned line in upper 65% that does NOT
+    # look like amount-in-words, a bank name header, or a printed label
+    _BANK_HEADER_RE = re.compile(
+        r'\b(?:bank|financial|harbour|harbor|branch|swift|iban|bhd|kwd|sar|aed|usd)\b',
+        re.IGNORECASE,
+    )
     upper = [
         (i, bbox, text, conf)
         for i, (bbox, text, conf) in enumerate(detections)
         if i not in assigned
-        and centroid_y(bbox) / h < 0.65
+        and 0.15 < centroid_y(bbox) / h < 0.65
         and len(text.strip()) > 2
+        and not _AMOUNT_WORDS_RE.search(text)
+        and not _BANK_HEADER_RE.search(text)
+        and not _PRINTED_LABELS_RE.match(text.strip())
     ]
     if upper:
         i, bbox, text, conf = max(upper, key=lambda x: len(x[2]))
@@ -295,12 +342,16 @@ def detect_fields_layout_free(img: np.ndarray) -> dict[str, list[OCRResult]]:
         fields["payee"].append(make_result(bbox, text, conf, script))
         assigned.add(i)
 
-    # Pass 6 — Memo: short unassigned line in lower half, not MICR area
+    # Pass 6 — Memo: short unassigned line in lower half, not MICR area,
+    # and not a printed cheque form label
     for i, (bbox, text, conf) in enumerate(detections):
         if i in assigned:
             continue
         cy = centroid_y(bbox) / h
-        if 0.55 < cy < 0.80 and 3 < len(text.strip()) < 60:
+        if (0.55 < cy < 0.80
+                and 3 < len(text.strip()) < 60
+                and not _PRINTED_LABELS_RE.match(text.strip())
+                and not _AMOUNT_WORDS_RE.search(text)):
             fields["memo"].append(make_result(bbox, text, conf))
             assigned.add(i)
 
