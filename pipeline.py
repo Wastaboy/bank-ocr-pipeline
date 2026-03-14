@@ -257,16 +257,22 @@ def detect_fields_layout_free(img: np.ndarray) -> dict[str, list[OCRResult]]:
             return ((',' in s or '،' in s), ('.' in s or '/' in s), len(s))
         return max(matches, key=score).group(0)
 
-    # Pass 3 — Amount digits: currency amount pattern
-    # Only assigned if the blob is in the right half of the cheque (amount box position)
-    # and extract only the best numeric match — not the whole blob
+    # Pass 3 — Amount digits: collect all right-half candidates then keep only the best one
+    amount_digit_candidates = []
     for i, (bbox, text, conf) in enumerate(detections):
         if i in assigned:
             continue
         numeric = _best_amount_match(text)
         if numeric and centroid_x(bbox) / w > 0.40:
-            fields["amount_digits"].append(make_result(bbox, numeric, conf))
-            assigned.add(i)
+            amount_digit_candidates.append((i, bbox, numeric, conf))
+
+    if amount_digit_candidates:
+        def _digit_score(c):
+            s = c[2]
+            return ((',' in s or '،' in s), ('.' in s or '/' in s), len(s))
+        best = max(amount_digit_candidates, key=_digit_score)
+        fields["amount_digits"].append(make_result(best[1], best[2], best[3]))
+        assigned.add(best[0])
 
     # Pass 3b — Positional fallback: if still no amount_digits found,
     # scan the right half for the most numeric-looking token
@@ -342,8 +348,13 @@ def detect_fields_layout_free(img: np.ndarray) -> dict[str, list[OCRResult]]:
         fields["payee"].append(make_result(bbox, text, conf, script))
         assigned.add(i)
 
+    _ACCOUNT_RE = re.compile(
+        r'\b(?:account|acc\.?|a/c)\b.*\d|\d{4}[\-\s]\d{4}[\-\s]\d{2,}',
+        re.IGNORECASE,
+    )
+
     # Pass 6 — Memo: short unassigned line in lower half, not MICR area,
-    # and not a printed cheque form label
+    # and not a printed label or account number
     for i, (bbox, text, conf) in enumerate(detections):
         if i in assigned:
             continue
@@ -351,7 +362,8 @@ def detect_fields_layout_free(img: np.ndarray) -> dict[str, list[OCRResult]]:
         if (0.55 < cy < 0.80
                 and 3 < len(text.strip()) < 60
                 and not _PRINTED_LABELS_RE.match(text.strip())
-                and not _AMOUNT_WORDS_RE.search(text)):
+                and not _AMOUNT_WORDS_RE.search(text)
+                and not _ACCOUNT_RE.search(text)):
             fields["memo"].append(make_result(bbox, text, conf))
             assigned.add(i)
 
@@ -416,6 +428,61 @@ FIELD_PARSERS = {
     "loan_amount":   parse_amount,
     "date":          parse_date,
 }
+
+
+_ONES = {
+    'zero':0,'one':1,'two':2,'three':3,'four':4,'five':5,'six':6,'seven':7,
+    'eight':8,'nine':9,'ten':10,'eleven':11,'twelve':12,'thirteen':13,
+    'fourteen':14,'fifteen':15,'sixteen':16,'seventeen':17,'eighteen':18,
+    'nineteen':19,'twenty':20,'thirty':30,'forty':40,'fifty':50,
+    'sixty':60,'seventy':70,'eighty':80,'ninety':90,
+}
+
+
+def words_to_amount(text: str) -> float | None:
+    """
+    Convert an English amount-in-words string to a float.
+
+    Handles Gulf currency structure: dinars + fils (1000 fils = 1 dinar).
+    Also handles standard cents/halalas (100 subunits = 1 major unit).
+
+    Examples:
+      "Sixty Seven Thousand Eight Hundred Ninety Dinars and Seven Hundred Fifty Fils Only"
+        → 67890.750
+      "Five Thousand Two Hundred Fifty Only" → 5250.0
+    """
+    text = text.lower()
+    # Split on the subunit keyword to separate major and minor parts
+    subunit_split = re.split(r'\b(?:fils?|halala[s]?|cent[s]?|baisa)\b', text, maxsplit=1)
+    major_text = re.sub(r'\b(?:dinar[s]?|riyal[s]?|pound[s]?|dollar[s]?|bhd|kwd|sar|aed|usd|only|and)\b', ' ', subunit_split[0])
+    minor_text = re.sub(r'\b(?:only|and)\b', ' ', subunit_split[1]) if len(subunit_split) > 1 else ''
+
+    def _parse_chunk(words: str) -> int:
+        tokens = re.findall(r'[a-z]+', words)
+        total = 0
+        current = 0
+        for tok in tokens:
+            if tok in _ONES:
+                current += _ONES[tok]
+            elif tok == 'hundred':
+                current = current * 100 if current else 100
+            elif tok in ('thousand', 'thousands'):
+                total += (current or 1) * 1000
+                current = 0
+            elif tok in ('million', 'millions'):
+                total += (current or 1) * 1_000_000
+                current = 0
+        return total + current
+
+    major = _parse_chunk(major_text)
+    minor = _parse_chunk(minor_text) if minor_text.strip() else 0
+
+    if major == 0 and minor == 0:
+        return None
+
+    # Determine subunit divisor: fils/baisa → /1000, cents/halala → /100
+    divisor = 1000 if re.search(r'\b(?:fils?|baisa)\b', text) else 100
+    return major + minor / divisor
 
 
 # ---------------------------------------------------------------------------
@@ -490,6 +557,30 @@ def process_document(
                 "needs_review": min_conf < CONFIDENCE_THRESHOLD,
                 "bbox": first_bbox,
             }
+
+        # Cross-validate amount_digits against amount_words
+        if "amount_digits" in fields and "amount_words" in fields:
+            words_val = words_to_amount(fields["amount_words"]["raw_text"])
+            digit_val  = fields["amount_digits"]["value"]
+            if words_val is not None:
+                if digit_val is None:
+                    # Words parsed but digits failed — use words-derived value
+                    fields["amount_digits"]["value"] = words_val
+                    fields["amount_digits"]["needs_review"] = False
+                else:
+                    # Both present — check if they agree within 1%
+                    try:
+                        pct_diff = abs(float(digit_val) - words_val) / max(words_val, 1)
+                        if pct_diff > 0.01:
+                            # Mismatch: trust amount_words (harder to OCR-corrupt a sentence)
+                            fields["amount_digits"]["value"] = words_val
+                            fields["amount_digits"]["needs_review"] = True
+                            fields["amount_digits"]["amount_words_override"] = True
+                        else:
+                            # They agree — use words_val as the canonical value (more precise)
+                            fields["amount_digits"]["value"] = words_val
+                    except (TypeError, ValueError):
+                        pass
 
         all_results.append({"page": page_num, "fields": fields})
 
