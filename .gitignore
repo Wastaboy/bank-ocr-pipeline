@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+*.pyo
+*.png
+*.jpg
+*.jpeg
+gui_backup.py
+create_shortcut.vbs

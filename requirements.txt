@@ -1,0 +1,7 @@
+easyocr>=1.7
+pymupdf>=1.23
+opencv-python-headless>=4.8
+pillow>=10.0
+transformers>=4.36
+torch>=2.1
+sentencepiece>=0.1.99
